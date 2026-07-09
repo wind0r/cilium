@@ -86,3 +86,4 @@
 #define DROP_EP_NOT_READY	-203
 #define DROP_NO_EGRESS_IP	-204
 #define DROP_PUNT_PROXY		-205 /* Mapped as drop code, though drop not necessary. */
+#define DROP_PMTU_RELAYED	-207 /* svc ICMP PMTU relay flooded the error to all nodes; original consumed. */

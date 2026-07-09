@@ -106,6 +106,7 @@ var errors = map[uint8]string{
 	204: "No Egress IP configured",
 	205: "Punt to proxy",
 	206: "No device",
+	207: "Service ICMP PMTU error relayed to nodes",
 }
 
 func extendedReason(extError int8) string {
