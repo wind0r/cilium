@@ -702,6 +702,7 @@ func ExecuteHeaderProbes(logger *slog.Logger) *FeatureProbes {
 	progHelpers := []ProgramHelper{
 		// common probes
 		{ebpf.CGroupSock, asm.FnSetRetval},
+		{ebpf.SchedCLS, asm.FnLoop},
 
 		// xdp related probes
 		{ebpf.XDP, asm.FnXdpGetBuffLen},
@@ -719,6 +720,7 @@ func ExecuteHeaderProbes(logger *slog.Logger) *FeatureProbes {
 func writeCommonHeader(writer io.Writer, probes *FeatureProbes) error {
 	features := map[string]bool{
 		"HAVE_SET_RETVAL": probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSock, asm.FnSetRetval}],
+		"HAVE_LOOP":       probes.ProgramHelpers[ProgramHelper{ebpf.SchedCLS, asm.FnLoop}],
 	}
 
 	return writeFeatureHeader(writer, features, true)

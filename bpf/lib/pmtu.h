@@ -94,6 +94,13 @@ pmtu_relay_ratelimited(__u16 rev_nat_index)
 #ifndef IS_BPF_XDP
 #define PMTU_FLOOD_MAX_NODES 64
 
+/* Upper bound on how many backends a single service's error is flooded to (see
+ * pmtu_flood_backends_v4/v6). Services with more backends than this have their
+ * tail skipped; a connection whose backend is past the cap is not recovered.
+ * bpf_loop iterates one body, so this only bounds the runtime loop, not the
+ * program size. */
+#define PMTU_FLOOD_MAX_BACKENDS 64
+
 /* Per-CPU scratch for the flood dedup set. Kept off the BPF stack: a 128-byte
  * seen[] embedded in the on-stack flood context makes the compiler emit a
  * whole-struct __builtin_memset() to zero-initialise it, which BPF builtins.h
@@ -140,6 +147,67 @@ icmp4_is_frag_needed(__u8 type, __u8 code)
 	return type == ICMP_DEST_UNREACH && code == ICMP_FRAG_NEEDED;
 }
 
+/* Does the embedded (offending) packet still carry an L4 checksum we must
+ * preserve? A frag-needed may embed only the IP header + 8 L4 bytes, too short
+ * for the TCP checksum; and a UDP checksum of 0 means "no checksum". In both
+ * cases the outer ICMP diff must account for the port change only. */
+static __always_inline int
+pmtu_inner_has_l4_csum_v4(struct __ctx_buff *ctx, __u8 proto, int inner_hdrlen,
+			  __u32 total_inner_len, __u32 icmp_l4_off, bool *has_csum)
+{
+	*has_csum = true;
+
+	if (proto == IPPROTO_TCP &&
+	    total_inner_len < (__u32)inner_hdrlen + TCP_CSUM_OFF + sizeof(__u16))
+		*has_csum = false;
+
+	if (proto == IPPROTO_UDP) {
+		__be16 l4_csum = 0;
+
+		if (ctx_load_bytes(ctx, (int)(icmp_l4_off + offsetof(struct udphdr, check)),
+				   &l4_csum, sizeof(l4_csum)) < 0)
+			return DROP_INVALID;
+		if (l4_csum == 0)
+			*has_csum = false;
+	}
+	return 0;
+}
+
+/* Reverse the DSR DNAT on the embedded packet and re-address the error to a
+ * backend: rewrite the embedded src old_addr:old_port -> new_addr:new_port
+ * (fixing the inner IP + L4 checksums), then rewrite the OUTER dst old_addr ->
+ * new_addr and amend the OUTER ICMP checksum for the embedded change. Fixing
+ * only the inner checksums leaves the outer ICMP checksum stale and the backend
+ * kernel silently drops the error. old_addr == the address currently in both
+ * the embedded src and the outer dst (VIP on the first hop; the previous
+ * backend when re-addressing a flood copy). */
+static __always_inline int
+pmtu_rewrite_to_backend_v4(struct __ctx_buff *ctx, __u8 proto, __u32 inner_l3_off,
+			   __u32 icmp_l4_off, int l4_off, __be32 old_addr,
+			   __be32 new_addr, __be16 old_port, __be16 new_port,
+			   bool has_inner_l4_csum)
+{
+	__wsum outer_csum_diff = 0;
+	int ret;
+
+	snat_v4_calc_icmp_error_csum_diff(old_addr, new_addr, old_port, new_port,
+					  has_inner_l4_csum, &outer_csum_diff);
+
+	ret = snat_v4_rewrite_headers(ctx, proto, (int)inner_l3_off, true,
+				      (int)icmp_l4_off,
+				      old_addr, new_addr, IPV4_SADDR_OFF,
+				      old_port, new_port, TCP_SPORT_OFF, 0);
+	if (!has_inner_l4_csum && ret == DROP_CSUM_L4)
+		ret = 0;
+	if (IS_ERR(ret))
+		return ret;
+
+	return snat_v4_rewrite_headers(ctx, IPPROTO_ICMP, ETH_HLEN, true,
+				       (int)l4_off,
+				       old_addr, new_addr, IPV4_DADDR_OFF,
+				       0, 0, 0, outer_csum_diff);
+}
+
 #ifndef IS_BPF_XDP
 struct pmtu_flood_ctx {
 	struct __ctx_buff *ctx;
@@ -148,6 +216,48 @@ struct pmtu_flood_ctx {
 	__be32 local_ip;	/* set to a local node IP: deliver the original locally */
 	__u32 n_seen;
 };
+
+/* Resolve L2 for dst_ip and clone-redirect a copy of the current packet there.
+ * Returns 1 if dst_ip is *this* node (fib NOT_FWDED) so the caller can deliver
+ * the original locally instead; 0 otherwise (delivered, unresolved, or error --
+ * the flood is best-effort per destination). */
+static __always_inline int
+pmtu_clone_redirect_v4(struct __ctx_buff *ctx, __be32 dst_ip)
+{
+	struct bpf_fib_lookup_padded fib = {};
+	int ret, oif;
+
+	fib.l.family = AF_INET;
+	fib.l.ipv4_dst = dst_ip;
+	fib.l.ifindex = ctx_get_ifindex(ctx);
+	ret = (int)fib_lookup(ctx, &fib.l, sizeof(fib.l), 0);
+	if (ret == BPF_FIB_LKUP_RET_NOT_FWDED)
+		return 1;		/* destination is the local node */
+	if (ret != BPF_FIB_LKUP_RET_SUCCESS && ret != BPF_FIB_LKUP_RET_NO_NEIGH)
+		return 0;
+	oif = fib.l.ifindex;
+	if (ret == BPF_FIB_LKUP_RET_SUCCESS) {
+		if (eth_store_daddr(ctx, fib.l.dmac, 0) < 0)
+			return 0;
+		if (eth_store_saddr(ctx, fib.l.smac, 0) < 0)
+			return 0;
+	} else {
+		/* Route known but neighbor unresolved: resolve the DMAC from the
+		 * neigh map (as fib_do_redirect does) instead of skipping the
+		 * destination, which would leave it without the PMTU copy. */
+		const union macaddr *smac = device_mac(oif);
+		const union macaddr *dmac = neigh_lookup_ip4(&dst_ip);
+
+		if (!dmac)
+			return 0;
+		if (eth_store_daddr_aligned(ctx, dmac->addr, 0) < 0)
+			return 0;
+		if (eth_store_saddr_aligned(ctx, smac->addr, 0) < 0)
+			return 0;
+	}
+	clone_redirect(ctx, oif, 0);
+	return 0;
+}
 
 /* bpf_for_each_map_elem callback over cilium_node_map_v2: send one copy of the
  * ICMP to each IPv4 node. Must return 0 (continue) or 1 (stop) for the verifier.
@@ -159,9 +269,7 @@ pmtu_flood_node_cb(void *map __maybe_unused, const void *key,
 	struct pmtu_flood_ctx *fc = arg;
 	const struct node_key *nk = key;
 	const struct node_value *nv = value;
-	struct bpf_fib_lookup_padded fib = {};
 	__be32 node_ip;
-	int ret, oif;
 
 	if (!fc || !nk || !nv)
 		return 1;
@@ -186,44 +294,111 @@ pmtu_flood_node_cb(void *map __maybe_unused, const void *key,
 		return 0;
 	fc->cur_daddr = node_ip;
 
-	/* Resolve L2 for node_ip and clone-redirect a copy there. */
-	fib.l.family = AF_INET;
-	fib.l.ipv4_dst = node_ip;
-	fib.l.ifindex = ctx_get_ifindex(fc->ctx);
-	ret = (int)fib_lookup(fc->ctx, &fib.l, sizeof(fib.l), 0);
-	if (ret == BPF_FIB_LKUP_RET_NOT_FWDED) {
-		/* Destination is *this* node (the one the ICMP landed on). Don't
-		 * clone-redirect a local IP; instead remember it so the caller
-		 * delivers the original to the local host stack — the Envoy
-		 * connection may be terminated here. */
+	/* Destination is *this* node (the one the ICMP landed on). Don't
+	 * clone-redirect a local IP; instead remember it so the caller delivers
+	 * the original to the local host stack — the Envoy connection may be
+	 * terminated here. */
+	if (pmtu_clone_redirect_v4(fc->ctx, node_ip))
 		fc->local_ip = node_ip;
-		return 0;
-	}
-	if (ret != BPF_FIB_LKUP_RET_SUCCESS && ret != BPF_FIB_LKUP_RET_NO_NEIGH)
-		return 0;
-	oif = fib.l.ifindex;
-	if (ret == BPF_FIB_LKUP_RET_SUCCESS) {
-		if (eth_store_daddr(fc->ctx, fib.l.dmac, 0) < 0)
-			return 0;
-		if (eth_store_saddr(fc->ctx, fib.l.smac, 0) < 0)
-			return 0;
-	} else {
-		/* Route known but neighbor unresolved: resolve the DMAC from the
-		 * neigh map (as fib_do_redirect does) instead of skipping this
-		 * node, which would leave it without the PMTU copy. */
-		const union macaddr *smac = device_mac(oif);
-		const union macaddr *dmac = neigh_lookup_ip4(&node_ip);
-
-		if (!dmac)
-			return 0;
-		if (eth_store_daddr_aligned(fc->ctx, dmac->addr, 0) < 0)
-			return 0;
-		if (eth_store_saddr_aligned(fc->ctx, smac->addr, 0) < 0)
-			return 0;
-	}
-	clone_redirect(fc->ctx, oif, 0);
 	return 0;
 }
+
+/* The DSR backend flood iterates the service's backends with bpf_loop(), which
+ * needs kernel >= 5.17. HAVE_LOOP is probed at agent startup (see probes.go); on
+ * older kernels the flood is compiled out and non-Maglev DSR falls back to the
+ * previous behavior (the error is not relayed). */
+#ifdef HAVE_LOOP
+/* State threaded through the DSR backend flood (bpf_loop callback). */
+struct pmtu_backend_flood_ctx {
+	struct __ctx_buff *ctx;
+	struct lb4_key key;	/* address = VIP, dport = svc_port; slot mutated */
+	__be32 cur_addr;	/* address currently written (VIP, then last backend) */
+	int l4_off;
+	__u32 inner_l3_off;
+	__u32 icmp_l4_off;
+	__be16 cur_port;
+	__u8 inner_proto;
+	bool has_inner_l4_csum;
+	int err;		/* first rewrite error, propagated out of the loop */
+};
+
+/* bpf_loop callback: re-address the error to backend slot (index + 1) and
+ * clone-redirect a copy to it. Returns 1 (stop) only on a hard rewrite error. */
+static long
+pmtu_flood_backend_cb_v4(__u32 index, void *arg)
+{
+	struct pmtu_backend_flood_ctx *bc = arg;
+	const struct lb4_service *be_slot;
+	const struct lb4_backend *backend;
+	int ret;
+
+	bc->key.backend_slot = (__u16)(index + 1);
+	be_slot = __lb4_lookup_backend_slot(&bc->key);
+	if (!be_slot || !be_slot->backend_id)
+		return 0;
+	backend = __lb4_lookup_backend(be_slot->backend_id);
+	if (!backend || backend->address == bc->cur_addr)
+		return 0;		/* missing, or already addressed here */
+
+	ret = pmtu_rewrite_to_backend_v4(bc->ctx, bc->inner_proto, bc->inner_l3_off,
+					 bc->icmp_l4_off, bc->l4_off, bc->cur_addr,
+					 backend->address, bc->cur_port,
+					 backend->port, bc->has_inner_l4_csum);
+	if (IS_ERR(ret)) {
+		bc->err = ret;
+		return 1;
+	}
+	bc->cur_addr = backend->address;
+	bc->cur_port = backend->port;
+
+	pmtu_clone_redirect_v4(bc->ctx, backend->address);
+	return 0;
+}
+
+/* Non-Maglev DSR: the backend cannot be re-derived statelessly (only the Maglev
+ * hash excludes the VIP), so copy the error to EVERY backend of the service. The
+ * backend that owns the flow matches it to its socket and caches the reduced
+ * PMTU; the rest get an error for a connection they do not have and ignore it.
+ * This is the CFP #19720 "copy to all endpoints" approach, applied to the DSR
+ * backends. TC path only (clone_redirect). Best-effort over an overlay: a remote
+ * backend in tunnel mode needs encapsulation that clone_redirect does not add.
+ * Consumes the original (each backend received a clone). */
+static __always_inline int
+pmtu_flood_backends_v4(struct __ctx_buff *ctx, const struct lb4_service *svc,
+		       const struct lb4_key *key, int l4_off, __u32 inner_l3_off,
+		       __u32 icmp_l4_off, __be32 vip, __be16 svc_port,
+		       __u8 inner_proto, int inner_hdrlen)
+{
+	struct pmtu_backend_flood_ctx bc = {
+		.ctx		= ctx,
+		.key		= *key,
+		.cur_addr	= vip,
+		.cur_port	= svc_port,
+		.l4_off		= l4_off,
+		.inner_l3_off	= inner_l3_off,
+		.icmp_l4_off	= icmp_l4_off,
+		.inner_proto	= inner_proto,
+	};
+	__u32 total_inner_len = (__u32)ctx_full_len(ctx) - inner_l3_off;
+	__u32 nr = svc->count;
+	int ret;
+
+	ret = pmtu_inner_has_l4_csum_v4(ctx, inner_proto, inner_hdrlen,
+					total_inner_len, icmp_l4_off,
+					&bc.has_inner_l4_csum);
+	if (ret < 0)
+		return ret;
+
+	if (nr > PMTU_FLOOD_MAX_BACKENDS)
+		nr = PMTU_FLOOD_MAX_BACKENDS;
+	loop(nr, pmtu_flood_backend_cb_v4, &bc, 0);
+	if (IS_ERR(bc.err))
+		return bc.err;
+
+	update_metrics(ctx_full_len(ctx), METRIC_EGRESS, REASON_MTU_ERROR_MSG);
+	return DROP_PMTU_RELAYED;
+}
+#endif /* HAVE_LOOP */
 #endif /* !IS_BPF_XDP */
 
 /*
@@ -363,7 +538,8 @@ handle_icmp_svc_pmtu_v4(struct __ctx_buff *ctx, struct iphdr *ip4, int l4_off,
 		/* DSR: re-derive the backend statelessly. Only the Maglev hash
 		 * excludes the VIP, so the (arbitrary) node the ICMP lands on picks
 		 * the same backend the ingress node did. Under any other algorithm
-		 * (e.g. random) the re-derived backend would differ, so skip.
+		 * the re-derived backend would differ, so instead of re-deriving we
+		 * flood the error to every backend of the service (below).
 		 *
 		 * Resolve the effective algorithm exactly as lb4_select_backend_id()
 		 * does (per-service value, falling back to the default) so this check
@@ -374,8 +550,20 @@ handle_icmp_svc_pmtu_v4(struct __ctx_buff *ctx, struct iphdr *ip4, int l4_off,
 		if (alg != LB_SELECTION_MAGLEV && alg != LB_SELECTION_RANDOM &&
 		    alg != LB_SELECTION_FIRST)
 			alg = lb_default_algorithm();
-		if (alg != LB_SELECTION_MAGLEV)
+		if (alg != LB_SELECTION_MAGLEV) {
+#if !defined(IS_BPF_XDP) && defined(HAVE_LOOP)
+			/* Non-Maglev DSR: copy the error to all backends (the one
+			 * owning the flow caches the PMTU, the rest ignore it). */
+			return pmtu_flood_backends_v4(ctx, svc, &key, l4_off,
+						      inner_l3_off, icmp_l4_off,
+						      inner.saddr, svc_port,
+						      inner.protocol,
+						      ipv4_hdrlen(&inner));
+#else
+			/* flood is TC-only and needs bpf_loop (HAVE_LOOP) */
 			return CTX_ACT_OK;
+#endif
+		}
 		backend_id = lb4_select_backend_id(ctx, &key, &tuple, svc);
 	} else {
 		/* SNAT-mode: the backend was chosen statefully on the ingress node
@@ -410,61 +598,25 @@ handle_icmp_svc_pmtu_v4(struct __ctx_buff *ctx, struct iphdr *ip4, int l4_off,
 		return CTX_ACT_OK;
 
 	/* Reverse the DSR DNAT on the embedded (inner) packet so the backend
-	 * kernel matches the error to its socket (backend:backend_port <-> client):
-	 * rewrite inner src VIP:svc_port -> backend->address:backend->port (fixing
-	 * the inner IP + inner L4 checksums), then rewrite the OUTER dst VIP ->
-	 * backend and amend the OUTER ICMP checksum for the embedded change. This
-	 * mirrors snat_v4_rev_nat_handle_icmp_error() + snat_v4_rev_nat()'s two-step
-	 * rewrite: fixing only the inner checksums leaves the outer ICMP checksum
-	 * stale and the backend kernel silently drops the error.
+	 * kernel matches the error to its socket (backend:backend_port <-> client),
+	 * and re-address the outer error to the backend. This mirrors
+	 * snat_v4_rev_nat_handle_icmp_error() + snat_v4_rev_nat()'s two-step rewrite
+	 * (see pmtu_rewrite_to_backend_v4()).
 	 */
 	{
 		__u32 total_inner_len = (__u32)ctx_full_len(ctx) - inner_l3_off;
-		bool has_inner_l4_csum = true;
-		__wsum outer_csum_diff = 0;
+		bool has_inner_l4_csum;
 
-		/* A frag-needed error may embed only the IP header + 8 L4 bytes,
-		 * which is too short to carry the inner L4 checksum. */
-		if (inner.protocol == IPPROTO_TCP &&
-		    total_inner_len < ipv4_hdrlen(&inner) + TCP_CSUM_OFF + sizeof(__u16))
-			has_inner_l4_csum = false;
-
-		/* For UDP a checksum of 0 means "no checksum"; treat it as absent
-		 * so the outer ICMP diff accounts for the port change only (the
-		 * address change is cancelled by the inner IP checksum). Matches
-		 * snat_v4_rev_nat_handle_icmp_error(). */
-		if (inner.protocol == IPPROTO_UDP) {
-			__be16 l4_csum = 0;
-
-			if (ctx_load_bytes(ctx, icmp_l4_off + offsetof(struct udphdr, check),
-					   &l4_csum, sizeof(l4_csum)) < 0)
-				return DROP_INVALID;
-			if (l4_csum == 0)
-				has_inner_l4_csum = false;
-		}
-
-		snat_v4_calc_icmp_error_csum_diff(inner.saddr, backend->address,
-						  svc_port, backend->port,
-						  has_inner_l4_csum, &outer_csum_diff);
-
-		/* (1) Rewrite the embedded packet. */
-		ret = snat_v4_rewrite_headers(ctx, inner.protocol, (int)inner_l3_off,
-					      true, (int)icmp_l4_off,
-					      inner.saddr, backend->address, IPV4_SADDR_OFF,
-					      svc_port, backend->port, TCP_SPORT_OFF, 0);
-		if (!has_inner_l4_csum && ret == DROP_CSUM_L4)
-			ret = 0;
-		if (IS_ERR(ret))
+		ret = pmtu_inner_has_l4_csum_v4(ctx, inner.protocol, ipv4_hdrlen(&inner),
+						total_inner_len, icmp_l4_off,
+						&has_inner_l4_csum);
+		if (ret < 0)
 			return ret;
 
-		/* (2) Rewrite the outer IP dst VIP -> backend (so normal pod routing
-		 * delivers to the backend) and amend the outer ICMP checksum. The old
-		 * outer daddr == VIP == inner.saddr, a stack value (the packet pointer
-		 * is stale after the write above). No outer port change. */
-		ret = snat_v4_rewrite_headers(ctx, IPPROTO_ICMP, ETH_HLEN, true,
-					      (int)l4_off,
-					      inner.saddr, backend->address, IPV4_DADDR_OFF,
-					      0, 0, 0, outer_csum_diff);
+		ret = pmtu_rewrite_to_backend_v4(ctx, inner.protocol, inner_l3_off,
+						 icmp_l4_off, l4_off, inner.saddr,
+						 backend->address, svc_port,
+						 backend->port, has_inner_l4_csum);
 		if (IS_ERR(ret))
 			return ret;
 	}
@@ -495,6 +647,30 @@ handle_icmp_svc_pmtu_v4(struct __ctx_buff *ctx, struct iphdr *ip4, int l4_off,
  *    in the enclosing ICMPv6 checksum (same reasoning as the stock
  *    snat_v6_rev_nat_handle_icmp_pkt_toobig()).
  */
+
+/* Re-address the error to a backend (IPv6): rewrite the embedded src
+ * old_addr:old_port -> new_addr:new_port, then the outer dst old_addr -> new_addr
+ * (snat_v6_rewrite_headers amends the ICMPv6 pseudo-header checksum). IPv6 has no
+ * L3 checksum, so the embedded address and L4 checksum changes cancel in the
+ * outer ICMPv6 checksum; no separate outer diff is needed. The caller must have
+ * rejected the UDP-checksum-0 case first (see the file header). */
+static __always_inline int
+pmtu_rewrite_to_backend_v6(struct __ctx_buff *ctx, __u8 nexthdr, __u32 inner_l3_off,
+			   __u32 icmp_l4_off, int l4_off, const union v6addr *old_addr,
+			   const union v6addr *new_addr, __be16 old_port, __be16 new_port)
+{
+	int ret;
+
+	ret = snat_v6_rewrite_headers(ctx, nexthdr, (int)inner_l3_off, true,
+				      (int)icmp_l4_off, old_addr, new_addr,
+				      IPV6_SADDR_OFF, old_port, new_port, TCP_SPORT_OFF);
+	if (IS_ERR(ret))
+		return ret;
+
+	return snat_v6_rewrite_headers(ctx, IPPROTO_ICMPV6, ETH_HLEN, true, l4_off,
+				       old_addr, new_addr, IPV6_DADDR_OFF, 0, 0, 0);
+}
+
 #ifndef IS_BPF_XDP
 struct pmtu_flood_ctx6 {
 	struct __ctx_buff *ctx;
@@ -506,6 +682,44 @@ struct pmtu_flood_ctx6 {
 	__u32 n_seen;
 };
 
+/* IPv6 counterpart of pmtu_clone_redirect_v4(). Returns 1 if dst_ip is the
+ * local node (fib NOT_FWDED), 0 otherwise (delivered / unresolved / error). */
+static __always_inline int
+pmtu_clone_redirect_v6(struct __ctx_buff *ctx, const union v6addr *dst_ip)
+{
+	struct bpf_fib_lookup_padded fib = {};
+	int ret, oif;
+
+	fib.l.family = AF_INET6;
+	ipv6_addr_copy((union v6addr *)&fib.l.ipv6_dst, dst_ip);
+	fib.l.ifindex = ctx_get_ifindex(ctx);
+	ret = (int)fib_lookup(ctx, &fib.l, sizeof(fib.l), 0);
+	if (ret == BPF_FIB_LKUP_RET_NOT_FWDED)
+		return 1;		/* destination is the local node */
+	if (ret != BPF_FIB_LKUP_RET_SUCCESS && ret != BPF_FIB_LKUP_RET_NO_NEIGH)
+		return 0;
+	oif = fib.l.ifindex;
+	if (ret == BPF_FIB_LKUP_RET_SUCCESS) {
+		if (eth_store_daddr(ctx, fib.l.dmac, 0) < 0)
+			return 0;
+		if (eth_store_saddr(ctx, fib.l.smac, 0) < 0)
+			return 0;
+	} else {
+		/* Route known, neighbor unresolved: resolve via the neigh map. */
+		const union macaddr *smac = device_mac(oif);
+		const union macaddr *dmac = neigh_lookup_ip6(dst_ip);
+
+		if (!dmac)
+			return 0;
+		if (eth_store_daddr_aligned(ctx, dmac->addr, 0) < 0)
+			return 0;
+		if (eth_store_saddr_aligned(ctx, smac->addr, 0) < 0)
+			return 0;
+	}
+	clone_redirect(ctx, oif, 0);
+	return 0;
+}
+
 static long
 pmtu_flood_node_cb6(void *map __maybe_unused, const void *key,
 		    const void *value, void *arg)
@@ -513,9 +727,8 @@ pmtu_flood_node_cb6(void *map __maybe_unused, const void *key,
 	struct pmtu_flood_ctx6 *fc = arg;
 	const struct node_key *nk = key;
 	const struct node_value *nv = value;
-	struct bpf_fib_lookup_padded fib = {};
 	union v6addr node_ip;
-	int ret, oif;
+	int ret;
 
 	if (!fc || !nk || !nv)
 		return 1;
@@ -536,38 +749,88 @@ pmtu_flood_node_cb6(void *map __maybe_unused, const void *key,
 		return 0;
 	fc->cur_daddr = node_ip;
 
-	fib.l.family = AF_INET6;
-	ipv6_addr_copy((union v6addr *)&fib.l.ipv6_dst, &node_ip);
-	fib.l.ifindex = ctx_get_ifindex(fc->ctx);
-	ret = (int)fib_lookup(fc->ctx, &fib.l, sizeof(fib.l), 0);
-	if (ret == BPF_FIB_LKUP_RET_NOT_FWDED) {
+	if (pmtu_clone_redirect_v6(fc->ctx, &node_ip)) {
 		fc->local_ip = node_ip;	/* deliver original locally after the loop */
 		fc->have_local = true;
-		return 0;
 	}
-	if (ret != BPF_FIB_LKUP_RET_SUCCESS && ret != BPF_FIB_LKUP_RET_NO_NEIGH)
-		return 0;
-	oif = fib.l.ifindex;
-	if (ret == BPF_FIB_LKUP_RET_SUCCESS) {
-		if (eth_store_daddr(fc->ctx, fib.l.dmac, 0) < 0)
-			return 0;
-		if (eth_store_saddr(fc->ctx, fib.l.smac, 0) < 0)
-			return 0;
-	} else {
-		/* Route known, neighbor unresolved: resolve via the neigh map. */
-		const union macaddr *smac = device_mac(oif);
-		const union macaddr *dmac = neigh_lookup_ip6(&node_ip);
-
-		if (!dmac)
-			return 0;
-		if (eth_store_daddr_aligned(fc->ctx, dmac->addr, 0) < 0)
-			return 0;
-		if (eth_store_saddr_aligned(fc->ctx, smac->addr, 0) < 0)
-			return 0;
-	}
-	clone_redirect(fc->ctx, oif, 0);
 	return 0;
 }
+
+#ifdef HAVE_LOOP		/* bpf_loop: kernel >= 5.17 (see the IPv4 path) */
+/* State threaded through the DSR backend flood (bpf_loop callback), IPv6. */
+struct pmtu_backend_flood_ctx6 {
+	struct __ctx_buff *ctx;
+	struct lb6_key key;	/* address = VIP, dport = svc_port; slot mutated */
+	union v6addr cur_addr;	/* address currently written (VIP, then last backend) */
+	int l4_off;
+	__u32 inner_l3_off;
+	__u32 icmp_l4_off;
+	__be16 cur_port;
+	__u8 inner_nexthdr;
+	int err;
+};
+
+static long
+pmtu_flood_backend_cb_v6(__u32 index, void *arg)
+{
+	struct pmtu_backend_flood_ctx6 *bc = arg;
+	const struct lb6_service *be_slot;
+	const struct lb6_backend *backend;
+	int ret;
+
+	bc->key.backend_slot = (__u16)(index + 1);
+	be_slot = __lb6_lookup_backend_slot(&bc->key);
+	if (!be_slot || !be_slot->backend_id)
+		return 0;
+	backend = __lb6_lookup_backend(be_slot->backend_id);
+	if (!backend || ipv6_addr_equals(&bc->cur_addr, &backend->address))
+		return 0;		/* missing, or already addressed here */
+
+	ret = pmtu_rewrite_to_backend_v6(bc->ctx, bc->inner_nexthdr, bc->inner_l3_off,
+					 bc->icmp_l4_off, bc->l4_off, &bc->cur_addr,
+					 &backend->address, bc->cur_port,
+					 backend->port);
+	if (IS_ERR(ret)) {
+		bc->err = ret;
+		return 1;
+	}
+	ipv6_addr_copy(&bc->cur_addr, &backend->address);
+	bc->cur_port = backend->port;
+
+	pmtu_clone_redirect_v6(bc->ctx, &bc->cur_addr);
+	return 0;
+}
+
+/* IPv6 non-Maglev DSR backend flood (see pmtu_flood_backends_v4). */
+static __always_inline int
+pmtu_flood_backends_v6(struct __ctx_buff *ctx, const struct lb6_service *svc,
+		       const struct lb6_key *key, int l4_off, __u32 inner_l3_off,
+		       __u32 icmp_l4_off, const union v6addr *vip, __be16 svc_port,
+		       __u8 inner_nexthdr)
+{
+	struct pmtu_backend_flood_ctx6 bc = {
+		.ctx		= ctx,
+		.key		= *key,
+		.cur_port	= svc_port,
+		.l4_off		= l4_off,
+		.inner_l3_off	= inner_l3_off,
+		.icmp_l4_off	= icmp_l4_off,
+		.inner_nexthdr	= inner_nexthdr,
+	};
+	__u32 nr = svc->count;
+
+	ipv6_addr_copy(&bc.cur_addr, vip);
+
+	if (nr > PMTU_FLOOD_MAX_BACKENDS)
+		nr = PMTU_FLOOD_MAX_BACKENDS;
+	loop(nr, pmtu_flood_backend_cb_v6, &bc, 0);
+	if (IS_ERR(bc.err))
+		return bc.err;
+
+	update_metrics(ctx_full_len(ctx), METRIC_EGRESS, REASON_MTU_ERROR_MSG);
+	return DROP_PMTU_RELAYED;
+}
+#endif /* HAVE_LOOP */
 #endif /* !IS_BPF_XDP */
 
 static __always_inline int
@@ -580,7 +843,7 @@ handle_icmp_svc_pmtu_v6(struct __ctx_buff *ctx, struct ipv6hdr *ip6, int l4_off,
 	const struct lb6_service *svc;
 	const struct lb6_backend *backend;
 	struct ipv6_ct_tuple tuple __align_stack_8 = {};
-	union v6addr vip, baddr;
+	union v6addr vip;
 	__be16 svc_port = 0, client_port = 0;
 	__u8 inner_nexthdr, type;
 	__u32 backend_id, icmp_l4_off;
@@ -699,16 +962,25 @@ handle_icmp_svc_pmtu_v6(struct __ctx_buff *ctx, struct ipv6hdr *ip6, int l4_off,
 	tuple.dport = client_port;
 
 	if (svc->flags2 & SVC_FLAG_FWD_MODE_DSR) {
-		/* DSR: re-derive the backend statelessly. Only Maglev picks the same
-		 * backend on any node (see the IPv4 path). Resolve the effective
-		 * algorithm the same way lb6_select_backend_id() does. */
+		/* DSR: re-derive the backend statelessly under Maglev; under any
+		 * other algorithm flood the error to every backend instead (see the
+		 * IPv4 path). Resolve the effective algorithm the same way
+		 * lb6_select_backend_id() does. */
 		__u32 alg = lb6_algorithm(svc);
 
 		if (alg != LB_SELECTION_MAGLEV && alg != LB_SELECTION_RANDOM &&
 		    alg != LB_SELECTION_FIRST)
 			alg = lb_default_algorithm();
-		if (alg != LB_SELECTION_MAGLEV)
+		if (alg != LB_SELECTION_MAGLEV) {
+#if !defined(IS_BPF_XDP) && defined(HAVE_LOOP)
+			return pmtu_flood_backends_v6(ctx, svc, &key, l4_off,
+						      inner_l3_off, icmp_l4_off,
+						      &vip, svc_port, inner_nexthdr);
+#else
+			/* flood is TC-only and needs bpf_loop (HAVE_LOOP) */
 			return CTX_ACT_OK;
+#endif
+		}
 		backend_id = lb6_select_backend_id(ctx, &key, &tuple, svc);
 	} else {
 		/* SNAT-mode: best-effort recovery from the service conntrack entry,
@@ -730,22 +1002,12 @@ handle_icmp_svc_pmtu_v6(struct __ctx_buff *ctx, struct ipv6hdr *ip6, int l4_off,
 	backend = __lb6_lookup_backend(backend_id);
 	if (!backend)
 		return CTX_ACT_OK;
-	ipv6_addr_copy(&baddr, (union v6addr *)&backend->address);
 
-	/* (1) Rewrite the embedded packet: inner src VIP:svc_port -> backend.
-	 * The embedded L4 checksum is fixed; the outer ICMPv6 checksum is left
-	 * unchanged (the inner address and inner L4 checksum changes cancel). */
-	ret = snat_v6_rewrite_headers(ctx, inner_nexthdr, (int)inner_l3_off, true,
-				      (int)icmp_l4_off, &vip, &baddr,
-				      IPV6_SADDR_OFF, svc_port, backend->port,
-				      TCP_SPORT_OFF);
-	if (IS_ERR(ret))
-		return ret;
-
-	/* (2) Rewrite the outer dst VIP -> backend and amend the ICMPv6 checksum
-	 * for the address change. old outer daddr == VIP == vip (stack value). */
-	ret = snat_v6_rewrite_headers(ctx, IPPROTO_ICMPV6, ETH_HLEN, true, l4_off,
-				      &vip, &baddr, IPV6_DADDR_OFF, 0, 0, 0);
+	/* Re-address the error to the backend (embedded src + outer dst), see
+	 * pmtu_rewrite_to_backend_v6(). */
+	ret = pmtu_rewrite_to_backend_v6(ctx, inner_nexthdr, inner_l3_off,
+					 icmp_l4_off, l4_off, &vip, &backend->address,
+					 svc_port, backend->port);
 	if (IS_ERR(ret))
 		return ret;
 
