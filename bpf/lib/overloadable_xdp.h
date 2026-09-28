@@ -119,6 +119,15 @@ static __always_inline __maybe_unused void ctx_set_xfer(struct xdp_md *ctx,
 	ctx_store_meta(ctx, XFER_MARKER, val);
 }
 
+static __always_inline __maybe_unused void ctx_clear_xfer(struct xdp_md *ctx,
+							  __u32 meta)
+{
+	__u32 val = ctx_load_meta(ctx, XFER_MARKER);
+
+	val &= ~meta;
+	ctx_store_meta(ctx, XFER_MARKER, val);
+}
+
 static __always_inline __maybe_unused void ctx_move_xfer(struct xdp_md *ctx)
 {
 	__u32 meta_xfer = ctx_load_meta(ctx, XFER_MARKER);

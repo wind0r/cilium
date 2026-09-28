@@ -770,10 +770,10 @@ type NodeKey struct {
 
 // NodeValue is generated from the BPF C type node_value.
 type NodeValue struct {
-	_   structs.HostLayout
-	ID  uint16
-	SPI uint8
-	Pad uint8
+	_     structs.HostLayout
+	ID    uint16
+	SPI   uint8
+	Flags uint8
 }
 
 // PolicyEntry is generated from the BPF C type policy_entry.

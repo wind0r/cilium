@@ -121,6 +121,12 @@ ctx_set_xfer(struct __sk_buff *ctx __maybe_unused, __u32 meta __maybe_unused)
 }
 
 static __always_inline __maybe_unused void
+ctx_clear_xfer(struct __sk_buff *ctx __maybe_unused, __u32 meta __maybe_unused)
+{
+	/* Only possible from XDP -> SKB. */
+}
+
+static __always_inline __maybe_unused void
 ctx_move_xfer(struct __sk_buff *ctx __maybe_unused)
 {
 	/* Only possible from XDP -> SKB. */

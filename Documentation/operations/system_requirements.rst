@@ -308,8 +308,10 @@ enabled by upgrading to more recent kernel versions as detailed below.
 Cilium Feature                                         Minimum Kernel Version
 ====================================================== ===============================
 :ref:`enable_multicast` (AMD64)                        >= 5.10
+Service ICMP PMTU relay (AMD64)                        >= 5.13
 IPv6 BIG TCP support                                   >= 5.19
 :ref:`enable_multicast` (AArch64)                      >= 6.0
+Service ICMP PMTU relay (AArch64)                      >= 6.0
 IPv4 BIG TCP support                                   >= 6.3
 :ref:`netkit`                                          >= 6.8
 ====================================================== ===============================

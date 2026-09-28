@@ -171,6 +171,45 @@ func newProgram(progType ebpf.ProgramType) (*ebpf.Program, error) {
 	return prog, nil
 }
 
+// HaveSubprogTailCalls returns nil if a program may mix bpf-to-bpf calls with
+// tail calls. The verifier rejects the combination when the JIT lacks
+// bpf_jit_supports_subprog_tailcalls() (Linux < 5.10 on x86, < 6.0 on arm64),
+// which matters for programs that use helper callbacks and also tail-call.
+var HaveSubprogTailCalls = sync.OnceValue(func() error {
+	progArray, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type:       ebpf.ProgramArray,
+		KeySize:    4,
+		ValueSize:  4,
+		MaxEntries: 1,
+	})
+	if err != nil {
+		return fmt.Errorf("creating prog array: %w", err)
+	}
+	defer progArray.Close()
+
+	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
+		Type: ebpf.SchedCLS,
+		Instructions: asm.Instructions{
+			asm.Mov.Reg(asm.R6, asm.R1),
+			asm.Call.Label("subprog"),
+			asm.Mov.Reg(asm.R1, asm.R6),
+			asm.LoadMapPtr(asm.R2, progArray.FD()),
+			asm.Mov.Imm(asm.R3, 0),
+			asm.FnTailCall.Call(),
+			asm.Mov.Imm(asm.R0, 0),
+			asm.Return(),
+			asm.Mov.Imm(asm.R0, 0).WithSymbol("subprog"),
+			asm.Return(),
+		},
+		License: "Apache-2.0",
+	})
+	if err != nil {
+		return fmt.Errorf("loading program with subprog and tail call: %w: %w", err, ErrNotSupported)
+	}
+	prog.Close()
+	return nil
+})
+
 // HaveBPF returns nil if the running kernel supports loading BPF programs.
 var HaveBPF = sync.OnceValue(func() error {
 	prog, err := newProgram(ebpf.SocketFilter)

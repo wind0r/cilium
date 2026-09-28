@@ -543,6 +543,10 @@ enum DropReason {
     // be evaluated. Split from DROP_FRAG_NOT_FOUND to distinguish ambient
     // external fragments from in-cluster fragment-tracking bugs.
     DROP_FRAG_NOT_FOUND_WORLD = 207;
+    // An ICMP PMTU error addressed to an L7/Ingress service VIP was flooded
+    // to every node so the proxy's socket learns the PMTU; the original was
+    // consumed.
+    DROP_PMTU_RELAYED = 208;
 }
 
 enum TrafficDirection {

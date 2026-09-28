@@ -21,6 +21,7 @@ import (
 	"github.com/cilium/cilium/pkg/maps/nodemap"
 	"github.com/cilium/cilium/pkg/node"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
+	"github.com/cilium/cilium/pkg/option"
 )
 
 const (
@@ -152,7 +153,7 @@ func (n *linuxNodeHandler) allocateIDForNode(oldNode *nodeTypes.Node, node *node
 
 			return n.allocateIDForNode(oldNode, node)
 		}
-		if err := n.mapNodeID(ip, nodeID, node.EncryptionKey); err != nil {
+		if err := n.mapNodeID(ip, nodeID, node.EncryptionKey, nodeFlags(node)); err != nil {
 			n.log.Error("Failed to map node IP address to allocated ID",
 				logfields.Error, err,
 				logfields.NodeID, nodeID,
@@ -229,15 +230,25 @@ func (n *linuxNodeHandler) deallocateNodeIDLocked(nodeID uint16, nodeIPs map[str
 	return errs
 }
 
+// nodeFlags returns the NodeFlag* bits the datapath needs to know about a node.
+func nodeFlags(node *nodeTypes.Node) uint8 {
+	var flags uint8
+
+	if node.Cluster != option.Config.ClusterName {
+		flags |= nodemap.NodeFlagRemoteCluster
+	}
+	return flags
+}
+
 // mapNodeID adds a node ID <> IP mapping to the local in-memory indexes and the
 // corresponding BPF map. If the BPF update fails, the indexes remain unchanged.
-func (n *linuxNodeHandler) mapNodeID(ip string, id uint16, SPI uint8) error {
+func (n *linuxNodeHandler) mapNodeID(ip string, id uint16, SPI uint8, flags uint8) error {
 	nodeIP, err := netip.ParseAddr(ip)
 	if err != nil {
 		return fmt.Errorf("invalid node IP %s: %w", ip, err)
 	}
 
-	if err := n.nodeMap.Update(nodeIP, id, SPI); err != nil {
+	if err := n.nodeMap.Update(nodeIP, id, SPI, flags); err != nil {
 		return err
 	}
 

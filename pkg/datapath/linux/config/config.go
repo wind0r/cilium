@@ -14,10 +14,15 @@ import (
 	"maps"
 	"net/netip"
 	"slices"
+	"sync"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
 
 	"github.com/cilium/cilium/pkg/common"
 	"github.com/cilium/cilium/pkg/datapath/config"
 	dpdef "github.com/cilium/cilium/pkg/datapath/linux/config/defines"
+	"github.com/cilium/cilium/pkg/datapath/linux/probes"
 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
 	"github.com/cilium/cilium/pkg/defaults"
 	endpoint "github.com/cilium/cilium/pkg/endpoint/types"
@@ -69,6 +74,7 @@ type HeaderfileWriter struct {
 	nodeExtraDefineFns []dpdef.Fn
 	sysctl             sysctl.Sysctl
 	kprCfg             kpr.KPRConfig
+	relayWarnOnce      sync.Once
 }
 
 func NewHeaderfileWriter(p WriterParams) (Writer, error) {
@@ -225,11 +231,22 @@ func (h *HeaderfileWriter) WriteNodeConfig(w io.Writer, cfg *config.Config) erro
 		cDefinesMap["DSR_ENCAP_NONE"] = fmt.Sprintf("%d", dsrEncapNone)
 
 		// Relay inbound ICMP "fragmentation needed" / "packet too big" errors
-		// addressed to a service VIP to the DSR backend that must lower its
-		// path MTU. The datapath self-gates per service, so this is independent
-		// of the load-balancer forwarding mode.
+		// addressed to a service VIP to the endpoint that must lower its path
+		// MTU: DSR backends directly, and L7/Ingress (Envoy) by flooding the
+		// error to all nodes. This is independent of the load-balancer
+		// forwarding mode -- the datapath self-gates per service -- so it is
+		// enabled for SNAT-mode clusters running L7 Ingress as well. The L7
+		// flood iterates the node map with bpf_for_each_map_elem(), whose
+		// callback is a subprogram inside the tail-calling bpf_host.
 		if option.Config.EnablePMTUDiscovery {
-			cDefinesMap["ENABLE_SVC_ICMP_PMTU_RELAY"] = "1"
+			if probes.HaveProgramHelper(h.log, ebpf.SchedCLS, asm.FnForEachMapElem) == nil &&
+				probes.HaveSubprogTailCalls() == nil {
+				cDefinesMap["ENABLE_SVC_ICMP_PMTU_RELAY"] = "1"
+			} else {
+				h.relayWarnOnce.Do(func() {
+					h.log.Warn("Disabled the service ICMP PMTU relay due to missing kernel support for bpf_for_each_map_elem() with tail calls (Linux 5.13 or later; 6.0 on AArch64)")
+				})
+			}
 		}
 
 		if cfg.LBConfig.LoadBalancerUsesDSR() {

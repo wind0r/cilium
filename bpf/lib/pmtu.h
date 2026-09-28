@@ -22,7 +22,9 @@
  *     it there. The backend's kernel caches the reduced PMTU for the connection.
  *
  *   - L7/Ingress (Envoy): the connection terminates at a proxy on one node that
- *     cannot be re-derived statelessly, so the error is left to the stack.
+ *     cannot be re-derived statelessly, so flood the error to every node with
+ *     the outer destination rewritten to each node's IP. Only the node holding
+ *     the transparent socket matches the embedded packet and caches the PMTU.
  *
  * No per-connection PMTU state is stored in the datapath.
  */
@@ -33,6 +35,9 @@
 #include "lb.h"
 #include "nat.h"
 #include "conntrack.h"
+#include "node.h"
+#include "fib.h"
+#include "eth.h"
 #include "eps.h"
 #include "l4.h"
 #ifdef ENABLE_IPV6
@@ -47,9 +52,9 @@
 #if defined(ENABLE_SVC_ICMP_PMTU_RELAY) && (defined(IS_BPF_HOST) || defined(IS_BPF_XDP))
 
 /* Bound the relay per service (rev_nat_index) so a spoofed frag-needed spray at
- * a VIP cannot amplify. 100 relayed errors/s per service, burstable to 1000, is
- * far above the handful a real connection produces at PMTU-discovery time.
- * Returns true to drop. */
+ * a VIP cannot amplify -- especially the L7 flood, which clones to every node.
+ * 100 relayed errors/s per service, burstable to 1000, is far above the handful
+ * a real connection produces at PMTU-discovery time. Returns true to drop. */
 static __always_inline bool
 pmtu_relay_ratelimited(__u16 rev_nat_index)
 {
@@ -66,7 +71,147 @@ pmtu_relay_ratelimited(__u16 rev_nat_index)
 	return !ratelimit_check_and_take(&rkey, &settings);
 }
 
+/* The L7 flood uses clone_redirect()/fib_lookup(), TC-only helpers, so it is
+ * compiled out for XDP (which hands such errors to TC instead).
+ *
+ * cilium_node_map_v2 is keyed per node *IP*, so a node contributes several
+ * entries (InternalIP, CiliumInternalIP, ...). Track the node IDs already
+ * flooded so each node is sent one copy. The set is bounded; on clusters with
+ * more than PMTU_FLOOD_MAX_NODES nodes the tail may receive duplicate (but
+ * harmless -- PMTU caching is idempotent) copies.
+ */
+#ifndef IS_BPF_XDP
+#define PMTU_FLOOD_MAX_NODES 64
+
+/* Per-CPU scratch for the flood dedup set. Map memory is always initialised
+ * for the verifier, so the flood only has to reset n_seen. */
+struct pmtu_flood_scratch {
+	__u16 seen[PMTU_FLOOD_MAX_NODES];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, struct pmtu_flood_scratch);
+	__uint(max_entries, 1);
+} cilium_pmtu_flood_scratch __section_maps_btf;
+
+/* Returns true if a copy already reached this node id. */
+static __always_inline bool
+pmtu_flood_seen(const __u16 *seen, __u32 n_seen, __u16 id)
+{
+	__u32 i;
+
+	if (!id)
+		return false;
+	for (i = 0; i < PMTU_FLOOD_MAX_NODES; i++) {
+		if (i >= n_seen)
+			break;
+		if (seen[i] == id)
+			return true;
+	}
+	return false;
+}
+
+/* Record a node id once a copy has actually reached it. A node contributes
+ * several map entries and not all of them are routable from the netdev (e.g.
+ * CiliumInternalIP in tunnel mode), so an entry that fails L2 resolution must
+ * not stop a later entry from serving the same node. */
+static __always_inline void
+pmtu_flood_mark(__u16 *seen, __u32 *n_seen, __u16 id)
+{
+	if (id && *n_seen < PMTU_FLOOD_MAX_NODES)
+		seen[(*n_seen)++] = id;
+}
+
+/* Set the L2 header for a clone to the node a FIB lookup resolved. The lookup
+ * is issued directly rather than via fib_lookup_v{4,6}(): those request
+ * BPF_FIB_LOOKUP_SKIP_NEIGH, and clone_redirect() needs the DMAC resolved. */
+static __always_inline bool
+pmtu_flood_l2(struct __ctx_buff *ctx, struct bpf_fib_lookup_padded *fib,
+	      int fib_ret)
+{
+	__s8 ext_err = 0;
+
+	if (fib_ret != BPF_FIB_LKUP_RET_SUCCESS && fib_ret != BPF_FIB_LKUP_RET_NO_NEIGH)
+		return false;
+	return fib_store_l2(ctx, fib, true, fib_ret, fib->l.ifindex, &ext_err) == 0;
+}
+#endif /* !IS_BPF_XDP */
+
 #ifdef ENABLE_IPV4
+
+#ifndef IS_BPF_XDP
+struct pmtu_flood_ctx {
+	struct __ctx_buff *ctx;
+	__u16 *seen;		/* -> per-CPU pmtu_flood_scratch.seen */
+	__u32 n_seen;
+	__be32 cur_daddr;	/* outer daddr currently written in the packet */
+	__be32 local_ip;	/* a local node IP, if one was iterated */
+	bool have_local;	/* deliver the original locally after the loop */
+};
+
+/* bpf_for_each_map_elem callback over cilium_node_map_v2: send one copy of the
+ * ICMP to each IPv4 node. Must return 0 (continue) or 1 (stop) for the verifier.
+ */
+static long
+pmtu_flood_node_cb(void *map __maybe_unused, const void *key,
+		   const void *value, void *arg)
+{
+	struct pmtu_flood_ctx *fc = arg;
+	const struct node_key *nk = key;
+	const struct node_value *nv = value;
+	struct bpf_fib_lookup_padded fib = {};
+	__be32 node_ip;
+	__wsum sum;
+	int ret;
+
+	if (!fc || !nk || !nv)
+		return 1;
+	if (nk->family != ENDPOINT_KEY_IPV4)
+		return 0;
+	if (nv->flags & NODE_F_REMOTE_CLUSTER)
+		return 0;		/* the proxy runs in this cluster only */
+	if (pmtu_flood_seen(fc->seen, fc->n_seen, nv->id))
+		return 0;
+	node_ip = nk->ip4.be32;
+	if (!node_ip)
+		return 0;
+
+	fib.l.family = AF_INET;
+	fib.l.ifindex = ctx_get_ifindex(fc->ctx);
+	fib.l.ipv4_dst = node_ip;
+	ret = (int)fib_lookup(fc->ctx, &fib.l, sizeof(fib.l), 0);
+	if (ret == BPF_FIB_LKUP_RET_NOT_FWDED) {
+		/* Not forwarded is either this host or an unreachable/blackholed
+		 * route; only a host endpoint gets the original delivered locally
+		 * (the Envoy connection may terminate here) instead of a clone. */
+		const struct endpoint_info *ep = __lookup_ip4_endpoint(node_ip);
+
+		if (!ep || !(ep->flags & ENDPOINT_F_HOST))
+			return 0;
+		fc->local_ip = node_ip;
+		fc->have_local = true;
+		pmtu_flood_mark(fc->seen, &fc->n_seen, nv->id);
+		return 0;
+	}
+	if (!pmtu_flood_l2(fc->ctx, &fib, ret))
+		return 0;
+
+	/* Address the copy to this node. The outer ICMP checksum does not cover
+	 * the IP header, so only the IP checksum changes. cur_daddr follows the
+	 * address actually in the packet, even if the checksum fix failed. */
+	ret = ipv4_l3_rewrite_addr(fc->ctx, ETH_HLEN, IPV4_DADDR_OFF, fc->cur_daddr,
+				   node_ip, &sum);
+	if (ret != DROP_WRITE_ERROR)
+		fc->cur_daddr = node_ip;
+	if (ret != 0)
+		return 0;
+	if (clone_redirect(fc->ctx, fib.l.ifindex, 0) == 0)
+		pmtu_flood_mark(fc->seen, &fc->n_seen, nv->id);
+	return 0;
+}
+#endif /* !IS_BPF_XDP */
 
 /*
  * handle_icmp_svc_pmtu_v4 - relay an ICMPv4 frag-needed addressed to a service
@@ -132,10 +277,48 @@ handle_icmp_svc_pmtu_v4(struct __ctx_buff *ctx, struct iphdr *ip4, int l4_off)
 		return CTX_ACT_OK;			/* not a service VIP */
 
 	/* L7/Ingress services (which also carry the DSR flag) terminate at a
-	 * cilium-envoy proxy whose node cannot be re-derived statelessly; the
-	 * backend below would not own the connection, so leave the error alone. */
-	if (lb4_svc_is_l7_loadbalancer(svc))
+	 * cilium-envoy proxy on one node; flood the error to every node so the
+	 * owner's kernel caches the PMTU for its transparent socket. */
+	if (lb4_svc_is_l7_loadbalancer(svc)) {
+#ifndef IS_BPF_XDP
+		struct pmtu_flood_ctx fc = {
+			.ctx = ctx,
+			.cur_daddr = inner.saddr,	/* == outer daddr (VIP) */
+		};
+		struct pmtu_flood_scratch *scratch;
+		__u32 zero = 0;
+		__wsum sum;
+
+		scratch = map_lookup_elem(&cilium_pmtu_flood_scratch, &zero);
+		if (!scratch)
+			return CTX_ACT_OK;
+		if (pmtu_relay_ratelimited(svc->rev_nat_index))
+			return DROP_RATE_LIMITED;
+		fc.seen = scratch->seen;
+
+		for_each_map_elem(&cilium_node_map_v2, pmtu_flood_node_cb, &fc, 0);
+		update_metrics(ctx_full_len(ctx), METRIC_EGRESS, REASON_MTU_ERROR_MSG);
+
+		/* Remote nodes got clones. If this node was iterated, hand the
+		 * original to the local stack addressed to the local node IP (the
+		 * loop left it pointing at the last remote node). */
+		if (fc.have_local) {
+			ret = ipv4_l3_rewrite_addr(ctx, ETH_HLEN, IPV4_DADDR_OFF,
+						   fc.cur_daddr, fc.local_ip, &sum);
+			if (IS_ERR(ret))
+				return ret;
+			return CTX_ACT_OK;
+		}
+		/* Original consumed; per-node copies were clone-redirected. */
+		return DROP_PMTU_RELAYED;
+#else
+		/* The flood needs TC-only helpers. Hand the packet to TC without
+		 * XFER_PKT_NO_SVC so its nodeport_lb4() reaches this hook again
+		 * instead of skipping nodeport for it. */
+		ctx_clear_xfer(ctx, XFER_PKT_NO_SVC);
 		return CTX_ACT_OK;
+#endif
+	}
 
 	/* L4 DSR: relay directly to the backend selected on this node. */
 	if (!lb4_svc_uses_dsr(svc))
@@ -266,6 +449,68 @@ handle_icmp_svc_pmtu_v4(struct __ctx_buff *ctx, struct iphdr *ip4, int l4_off)
  *    address change and the embedded L4 checksum change cancel out in the
  *    enclosing ICMPv6 checksum (as in snat_v6_rev_nat_handle_icmp_pkt_toobig()).
  */
+#ifndef IS_BPF_XDP
+struct pmtu_flood_ctx6 {
+	struct __ctx_buff *ctx;
+	__u16 *seen;		/* -> per-CPU pmtu_flood_scratch.seen */
+	__u32 n_seen;
+	union v6addr cur_daddr;	/* outer daddr currently written in the packet */
+	union v6addr local_ip;	/* a local node IP, if one was iterated */
+	int l4_off;		/* outer ICMPv6 header, for the pseudo-header csum */
+	bool have_local;	/* deliver the original locally after the loop */
+};
+
+static long
+pmtu_flood_node_cb6(void *map __maybe_unused, const void *key,
+		    const void *value, void *arg)
+{
+	struct pmtu_flood_ctx6 *fc = arg;
+	const struct node_key *nk = key;
+	const struct node_value *nv = value;
+	struct bpf_fib_lookup_padded fib = {};
+	union v6addr node_ip;
+	int ret;
+
+	if (!fc || !nk || !nv)
+		return 1;
+	if (nk->family != ENDPOINT_KEY_IPV6)
+		return 0;
+	if (nv->flags & NODE_F_REMOTE_CLUSTER)
+		return 0;
+	if (pmtu_flood_seen(fc->seen, fc->n_seen, nv->id))
+		return 0;
+	node_ip = nk->ip6;
+
+	fib.l.family = AF_INET6;
+	fib.l.ifindex = ctx_get_ifindex(fc->ctx);
+	ipv6_addr_copy((union v6addr *)&fib.l.ipv6_dst, &node_ip);
+	ret = (int)fib_lookup(fc->ctx, &fib.l, sizeof(fib.l), 0);
+	if (ret == BPF_FIB_LKUP_RET_NOT_FWDED) {
+		const struct endpoint_info *ep = __lookup_ip6_endpoint(&node_ip);
+
+		if (!ep || !(ep->flags & ENDPOINT_F_HOST))
+			return 0;
+		fc->local_ip = node_ip;
+		fc->have_local = true;
+		pmtu_flood_mark(fc->seen, &fc->n_seen, nv->id);
+		return 0;
+	}
+	if (!pmtu_flood_l2(fc->ctx, &fib, ret))
+		return 0;
+
+	/* Address the copy to this node and amend the ICMPv6 checksum for the
+	 * pseudo-header change. */
+	if (snat_v6_rewrite_headers(fc->ctx, IPPROTO_ICMPV6, ETH_HLEN, true,
+				    fc->l4_off, &fc->cur_daddr, &node_ip,
+				    IPV6_DADDR_OFF, 0, 0, 0, 0) < 0)
+		return 0;
+	fc->cur_daddr = node_ip;
+	if (clone_redirect(fc->ctx, fib.l.ifindex, 0) == 0)
+		pmtu_flood_mark(fc->seen, &fc->n_seen, nv->id);
+	return 0;
+}
+#endif /* !IS_BPF_XDP */
+
 static __always_inline int
 handle_icmp_svc_pmtu_v6(struct __ctx_buff *ctx, struct ipv6hdr *ip6, int l4_off)
 {
@@ -319,8 +564,43 @@ handle_icmp_svc_pmtu_v6(struct __ctx_buff *ctx, struct ipv6hdr *ip6, int l4_off)
 	if (!svc)
 		return CTX_ACT_OK;
 
-	if (lb6_svc_is_l7_loadbalancer(svc))
-		return CTX_ACT_OK;			/* see the IPv4 path */
+	/* L7/Ingress: flood the error to every node (see the IPv4 path). */
+	if (lb6_svc_is_l7_loadbalancer(svc)) {
+#ifndef IS_BPF_XDP
+		struct pmtu_flood_ctx6 fc = {
+			.ctx = ctx,
+			.l4_off = l4_off,
+		};
+		struct pmtu_flood_scratch *scratch;
+		__u32 zero = 0;
+
+		scratch = map_lookup_elem(&cilium_pmtu_flood_scratch, &zero);
+		if (!scratch)
+			return CTX_ACT_OK;
+		if (pmtu_relay_ratelimited(svc->rev_nat_index))
+			return DROP_RATE_LIMITED;
+		fc.seen = scratch->seen;
+		ipv6_addr_copy(&fc.cur_daddr, &key.address);
+
+		for_each_map_elem(&cilium_node_map_v2, pmtu_flood_node_cb6, &fc, 0);
+		update_metrics(ctx_full_len(ctx), METRIC_EGRESS, REASON_MTU_ERROR_MSG);
+
+		if (fc.have_local) {
+			ret = snat_v6_rewrite_headers(ctx, IPPROTO_ICMPV6, ETH_HLEN,
+						      true, l4_off, &fc.cur_daddr,
+						      &fc.local_ip, IPV6_DADDR_OFF,
+						      0, 0, 0, 0);
+			if (IS_ERR(ret))
+				return ret;
+			return CTX_ACT_OK;
+		}
+		return DROP_PMTU_RELAYED;
+#else
+		/* TC-only flood; see the IPv4 path. */
+		ctx_clear_xfer(ctx, XFER_PKT_NO_SVC);
+		return CTX_ACT_OK;
+#endif
+	}
 
 	if (!lb6_svc_uses_dsr(svc))
 		return CTX_ACT_OK;			/* SNAT-mode: out of scope */
