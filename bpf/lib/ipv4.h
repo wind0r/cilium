@@ -58,6 +58,23 @@ static __always_inline int ipv4_load_daddr(const struct __ctx_buff *ctx, int off
 	return ctx_load_bytes(ctx, off + offsetof(struct iphdr, daddr), dst, 4);
 }
 
+/* Rewrite one IPv4 address in the header at l3_off and fix up the IP checksum.
+ * Returns the address csum diff in *sum for any dependent L4 checksum fixup.
+ */
+static __always_inline int
+ipv4_l3_rewrite_addr(struct __ctx_buff *ctx, int l3_off, __u16 addr_off,
+		     __be32 old_addr, __be32 new_addr, __wsum *sum)
+{
+	*sum = csum_diff(&old_addr, 4, &new_addr, 4, 0);
+	if (ctx_store_bytes(ctx, l3_off + addr_off, &new_addr, 4, 0) < 0)
+		return DROP_WRITE_ERROR;
+
+	if (ipv4_csum_update_by_diff(ctx, l3_off, *sum) < 0)
+		return DROP_CSUM_L3;
+
+	return 0;
+}
+
 static __always_inline int ipv4_dec_ttl(struct __ctx_buff *ctx, int off,
 					struct iphdr *ip4)
 {

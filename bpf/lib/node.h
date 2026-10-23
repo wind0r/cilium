@@ -19,10 +19,13 @@ struct node_key {
 	};
 };
 
+/* The node belongs to another ClusterMesh cluster. */
+#define NODE_F_REMOTE_CLUSTER	(1 << 0)
+
 struct node_value {
 	__u16 id;
 	__u8  spi;
-	__u8  pad;
+	__u8  flags;	/* NODE_F_* */
 };
 
 struct {

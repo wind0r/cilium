@@ -55,6 +55,48 @@ static __always_inline bool fib_ok(int ret)
 	return likely(ret == CTX_ACT_TX || ret == CTX_ACT_REDIRECT);
 }
 
+/* Write the L2 addresses for a redirect to @oif: from @fib_params after a
+ * successful FIB lookup, otherwise the DMAC comes from the neighbour map (when
+ * @allow_neigh_map) and the SMAC from the device.
+ *
+ * Returns 0, or DROP_NO_FIB when the DMAC couldn't be resolved.
+ */
+static __always_inline int
+fib_store_l2(struct __ctx_buff *ctx,
+	     const struct bpf_fib_lookup_padded *fib_params,
+	     bool allow_neigh_map, int fib_result, __u32 oif, __s8 *ext_err)
+{
+	if (fib_result == BPF_FIB_LKUP_RET_SUCCESS) {
+		if (eth_store_daddr(ctx, fib_params->l.dmac, 0) < 0)
+			return DROP_WRITE_ERROR;
+		if (eth_store_saddr(ctx, fib_params->l.smac, 0) < 0)
+			return DROP_WRITE_ERROR;
+	} else {
+		const union macaddr *smac = device_mac(oif);
+		const union macaddr *dmac = NULL;
+
+		if (allow_neigh_map) {
+			/* The neigh_record_ip{4,6} locations are mainly from
+			 * inbound client traffic on the load-balancer where we
+			 * know that replies need to go back to them.
+			 */
+			dmac = fib_params->l.family == AF_INET ?
+				neigh_lookup_ip4(&fib_params->l.ipv4_dst) :
+				neigh_lookup_ip6((void *)&fib_params->l.ipv6_dst);
+		}
+
+		if (!dmac) {
+			*ext_err = BPF_FIB_MAP_NO_NEIGH;
+			return DROP_NO_FIB;
+		}
+		if (eth_store_daddr_aligned(ctx, dmac->addr, 0) < 0)
+			return DROP_WRITE_ERROR;
+		if (eth_store_saddr_aligned(ctx, smac->addr, 0) < 0)
+			return DROP_WRITE_ERROR;
+	}
+	return 0;
+}
+
  /* fib_do_redirect will redirect the ctx to a particular output interface.
   * @arg ctx			packet
   * @arg needs_l2_check		check for L3 -> L2 redirect
@@ -86,10 +128,11 @@ fib_do_redirect(struct __ctx_buff *ctx, const bool needs_l2_check,
 		const struct bpf_fib_lookup_padded *fib_params,
 		bool allow_neigh_map, int fib_result, __u32 oif, __s8 *ext_err)
 {
+	int ret;
+
 	/* determine if we need to append layer 2 header */
 	if (needs_l2_check) {
 		bool l2_hdr_required = true;
-		int ret;
 
 		ret = maybe_add_l2_hdr(ctx, oif, &l2_hdr_required);
 		if (ret != 0)
@@ -119,34 +162,10 @@ fib_do_redirect(struct __ctx_buff *ctx, const bool needs_l2_check,
 	if (neigh_resolver_without_nh_available())
 		return (int)redirect_neigh(oif, NULL, 0, 0);
 
-	if (fib_result == BPF_FIB_LKUP_RET_SUCCESS) {
-		if (eth_store_daddr(ctx, fib_params->l.dmac, 0) < 0)
-			return DROP_WRITE_ERROR;
-		if (eth_store_saddr(ctx, fib_params->l.smac, 0) < 0)
-			return DROP_WRITE_ERROR;
-	} else {
-		const union macaddr *smac = device_mac(oif);
-		const union macaddr *dmac = NULL;
-
-		if (allow_neigh_map) {
-			/* The neigh_record_ip{4,6} locations are mainly from
-			 * inbound client traffic on the load-balancer where we
-			 * know that replies need to go back to them.
-			 */
-			dmac = fib_params->l.family == AF_INET ?
-				neigh_lookup_ip4(&fib_params->l.ipv4_dst) :
-				neigh_lookup_ip6((void *)&fib_params->l.ipv6_dst);
-		}
-
-		if (!dmac) {
-			*ext_err = BPF_FIB_MAP_NO_NEIGH;
-			return DROP_NO_FIB;
-		}
-		if (eth_store_daddr_aligned(ctx, dmac->addr, 0) < 0)
-			return DROP_WRITE_ERROR;
-		if (eth_store_saddr_aligned(ctx, smac->addr, 0) < 0)
-			return DROP_WRITE_ERROR;
-	}
+	ret = fib_store_l2(ctx, fib_params, allow_neigh_map, fib_result, oif,
+			   ext_err);
+	if (ret != 0)
+		return ret;
 out_send:
 	return (int)ctx_redirect(ctx, oif, 0);
 }

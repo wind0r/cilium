@@ -88,3 +88,4 @@
 #define DROP_PUNT_PROXY		-205 /* Mapped as drop code, though drop not necessary. */
 /* -206 (DROP_NO_DEVICE) was retired and never released; do not reuse. */
 #define DROP_FRAG_NOT_FOUND_WORLD	-207
+#define DROP_PMTU_RELAYED	-208 /* svc ICMP PMTU relay flooded the error to all nodes; original consumed. */

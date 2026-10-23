@@ -30,8 +30,8 @@ const (
 // MapV2 provides access to the eBPF map node.
 type MapV2 interface {
 	// Update inserts or updates the node map object associated with the provided
-	// IP, node id, and SPI.
-	Update(ip netip.Addr, nodeID uint16, SPI uint8) error
+	// IP, node id, SPI and NodeFlag* flags.
+	Update(ip netip.Addr, nodeID uint16, SPI uint8, flags uint8) error
 
 	// Delete deletes the node map object associated with the provided
 	// IP.
@@ -104,15 +104,18 @@ func newNodeKey(ip netip.Addr) NodeKey {
 	return result
 }
 
+// NodeFlagRemoteCluster marks a node of another ClusterMesh cluster.
+const NodeFlagRemoteCluster uint8 = 1 << 0
+
 type NodeValueV2 struct {
 	NodeID uint16
 	SPI    uint8
-	Pad    uint8
+	Flags  uint8
 }
 
-func (m *nodeMapV2) Update(ip netip.Addr, nodeID uint16, SPI uint8) error {
+func (m *nodeMapV2) Update(ip netip.Addr, nodeID uint16, SPI uint8, flags uint8) error {
 	key := newNodeKey(ip)
-	val := NodeValueV2{NodeID: nodeID, SPI: SPI}
+	val := NodeValueV2{NodeID: nodeID, SPI: SPI, Flags: flags}
 	if err := m.bpfMap.Update(key, val, 0); err != nil {
 		return fmt.Errorf("failed to update node map: %w", err)
 	}
